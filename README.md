@@ -93,7 +93,7 @@ N 的实际覆盖碎片。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/analyze` | 分析规则集（默认保存；`save:false` 只算不存） |
+| POST | `/api/analyze` | 分析规则集（默认保存；同一规则集重复/并发提交复用首次保存的版本及其 `name`/`created_at`；`save:false` 只算不存） |
 | POST | `/api/analyses/{id}/simulate` | 基于已保存版本预演 add/replace/remove 规则变更（**不落库**），返回新分析结果与语义差异 |
 | POST | `/api/analyses/{id}/merge-precheck` | **双批次变更合并预检**：A、B 两组 add/replace/remove 基于同一基线分别重算，检测结构冲突/地址动作冲突/合并冲突（**不落库**），无冲突时返回合并分析与相对基线差异 |
 | POST | `/api/analyses/{id}/quarantine-plan` | **临时封禁方案预演**：给定严格目标 CIDR 与新规则 ID 前缀，确定性生成 `priority=0` 的 deny 新增规则清单，使目标内全部转为 deny、目标外动作不变（**不落库**） |
@@ -1394,6 +1394,10 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 → 更新指针并 +1 → 追加历史"，并发发布由 SQLite 写锁串行化，revision 不匹配的请求得到
 `409`，保证不会互相覆盖。
 
+保存分析版本同样在单个 `BEGIN IMMEDIATE` 写事务内"按 `ruleset_hash` 查重 → 不存在才插入"，
+并发保存同一规则集由 SQLite 写锁串行化：重复/并发提交原子地复用首次保存的版本记录，
+不会重复插入规则与发现，也不会撞 `analyses` 主键。
+
 `covered` 以十进制文本存储，以容纳超出 64 位整数范围的 IPv6 地址计数（如 /32 的 2^96）。
 
 ### 确定性 / 幂等
@@ -1401,6 +1405,14 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 版本 ID = `an_` + `sha256(规范化输入)` 的前 16 个十六进制字符。规范化输入包含
 `rule_id / cidr / action / priority / source_tag`，与提交顺序无关地以规范 JSON
 （排序键、无空白）序列化。重复提交同一规则集返回**同一个版本 ID**，数据库中只存一份。
+
+**重复提交语义**（`save` 默认 `true` 时）：保存在**单个 `BEGIN IMMEDIATE` 写事务**内
+"按 `ruleset_hash` 查重 → 不存在才写入 analyses/rules/findings"，因此并发提交同一规则集
+会被 SQLite 写锁串行化——所有成功请求拿到**同一个版本 ID**，库里只有**一份**版本、
+规则与发现记录，不会因撞 `analyses` 主键而返回服务错误。重复提交即使携带不同的 `name`，
+响应中的 `name`、`created_at` 也以**首次保存版本**为准，与 `GET /api/analyses/{id}` 和
+`GET /api/analyses` 版本列表完全一致。`save: false` 只分析不入库（`persisted: false`），
+此时响应的 `name`/`created_at` 取自本次请求，数据库不产生任何记录。
 
 ### 复杂度
 

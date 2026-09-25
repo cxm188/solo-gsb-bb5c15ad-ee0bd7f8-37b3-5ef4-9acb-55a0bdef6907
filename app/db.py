@@ -164,79 +164,113 @@ def save_analysis(
     analysis_id: str,
     name: str | None,
     result: dict[str, Any],
-) -> str:
-    """Persist a complete analysis. Returns the id (existing id if the same
-    ruleset hash was already stored — the API makes repeated submits idempotent).
+) -> dict[str, Any]:
+    """Persist a complete analysis, atomically reusing an identical stored version.
+
+    The dedupe lookup and the insert run in one immediate (write) SQLite
+    transaction, so concurrent saves of the same ruleset are serialized by the
+    database write lock: exactly one request inserts, and every other one
+    reuses the stored row instead of crashing on the ``analyses`` primary key.
+    Only one copy of the version, its rules and its findings is ever stored.
+
+    Returns the stored ``{"id", "name", "created_at"}``.  For a repeat
+    submission those are the *first* saved version's metadata (even when the
+    repeat carries a different ``name``), so the API response stays consistent
+    with ``GET /api/analyses/{id}`` and the version list.
     """
-    with _connect() as conn:
+    conn = _connect()
+    # An unmanaged transaction: BEGIN IMMEDIATE takes the write lock up front
+    # so two competing saves cannot both observe the ruleset as missing.
+    conn.isolation_level = None
+    saved: dict[str, Any]
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
-            "SELECT id FROM analyses WHERE ruleset_hash = ?",
+            "SELECT id, name, created_at FROM analyses WHERE ruleset_hash = ?",
             (result["ruleset_hash"],),
         ).fetchone()
         if existing is not None:
-            return existing["id"]
-
-        created_at = utc_now_iso()
-        conn.execute(
-            """INSERT INTO analyses
-               (id, name, ruleset_hash, analyzer_version, created_at, rule_count, result_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                analysis_id,
-                name,
-                result["ruleset_hash"],
-                result["analyzer_version"],
-                created_at,
-                result["summary"]["rule_count"],
-                json.dumps(result, ensure_ascii=False),
-            ),
-        )
-        conn.executemany(
-            """INSERT INTO rules
-               (analysis_id, rule_index, rule_id, cidr, ip_version, action, priority,
-                source_tag, role, status, covered, has_conflict)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [
+            # Already stored (by an earlier or a concurrently winning request):
+            # reuse that version and do not duplicate rules/findings rows.
+            saved = {
+                "id": existing["id"],
+                "name": existing["name"],
+                "created_at": existing["created_at"],
+            }
+        else:
+            created_at = utc_now_iso()
+            conn.execute(
+                """INSERT INTO analyses
+                   (id, name, ruleset_hash, analyzer_version, created_at, rule_count, result_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     analysis_id,
-                    r["index"],
-                    r["rule_id"],
-                    r["cidr"],
-                    r["ip_version"],
-                    r["action"],
-                    r["priority"],
-                    r["source_tag"],
-                    r["role"],
-                    r["status"],
-                    str(r["covered"]),  # IPv6 counts exceed SQLite INTEGER range
-                    1 if r["has_conflict"] else 0,
-                )
-                for r in result["rules"]
-            ],
-        )
-        finding_rows = []
-        seq = 0
-        for f in result["findings"]:
-            finding_rows.append(
-                (
-                    analysis_id,
-                    seq,
-                    f["type"],
-                    f["severity"],
-                    f.get("rule_id"),
-                    f.get("other_rule_id"),
-                    1 if f.get("behavioral") else 0,
-                    json.dumps(f, ensure_ascii=False),
-                )
+                    name,
+                    result["ruleset_hash"],
+                    result["analyzer_version"],
+                    created_at,
+                    result["summary"]["rule_count"],
+                    json.dumps(result, ensure_ascii=False),
+                ),
             )
-            seq += 1
-        conn.executemany(
-            """INSERT INTO findings
-               (analysis_id, seq, kind, severity, rule_id, other_rule_id, behavioral, payload_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            finding_rows,
-        )
-        return analysis_id
+            conn.executemany(
+                """INSERT INTO rules
+                   (analysis_id, rule_index, rule_id, cidr, ip_version, action, priority,
+                    source_tag, role, status, covered, has_conflict)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        analysis_id,
+                        r["index"],
+                        r["rule_id"],
+                        r["cidr"],
+                        r["ip_version"],
+                        r["action"],
+                        r["priority"],
+                        r["source_tag"],
+                        r["role"],
+                        r["status"],
+                        str(r["covered"]),  # IPv6 counts exceed SQLite INTEGER range
+                        1 if r["has_conflict"] else 0,
+                    )
+                    for r in result["rules"]
+                ],
+            )
+            finding_rows = []
+            seq = 0
+            for f in result["findings"]:
+                finding_rows.append(
+                    (
+                        analysis_id,
+                        seq,
+                        f["type"],
+                        f["severity"],
+                        f.get("rule_id"),
+                        f.get("other_rule_id"),
+                        1 if f.get("behavioral") else 0,
+                        json.dumps(f, ensure_ascii=False),
+                    )
+                )
+                seq += 1
+            conn.executemany(
+                """INSERT INTO findings
+                   (analysis_id, seq, kind, severity, rule_id, other_rule_id, behavioral, payload_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                finding_rows,
+            )
+            saved = {"id": analysis_id, "name": name, "created_at": created_at}
+        conn.execute("COMMIT")
+    except Exception:
+        # ROLLBACK is a no-op when the transaction already ended; ignore that
+        # and let the original exception propagate.
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        conn.close()
+        raise
+    conn.close()
+    return saved
 
 
 def get_analysis(analysis_id: str) -> dict[str, Any] | None:

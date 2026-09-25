@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -221,6 +222,69 @@ def test_idempotent_submission_and_versions(client: TestClient) -> None:
     assert fetched["ruleset_hash"] == first["ruleset_hash"]
 
     assert client.get("/api/analyses/does-not-exist").status_code == 404
+
+
+def test_repeat_submit_with_different_name_reuses_first_version(client: TestClient) -> None:
+    body = {"rules": [{"cidr": "10.0.0.0/8", "action": "permit"}], "name": "first"}
+    first = client.post("/api/analyze", json=body).json()
+    second = client.post("/api/analyze", json={**body, "name": "second"}).json()
+    assert second["id"] == first["id"]
+    assert second["persisted"] is True
+    # The stored (first) version's metadata wins, not the repeat request's.
+    assert second["name"] == "first"
+    assert second["created_at"] == first["created_at"]
+
+    fetched = client.get(f"/api/analyses/{first['id']}").json()
+    assert fetched["name"] == "first"
+    assert fetched["created_at"] == first["created_at"]
+
+    listing = client.get("/api/analyses").json()
+    assert listing["total"] == 1
+    assert listing["analyses"][0]["name"] == "first"
+    assert listing["analyses"][0]["created_at"] == first["created_at"]
+
+
+def test_concurrent_duplicate_saves_share_one_version(client: TestClient) -> None:
+    # Racing saves of the same rule set must not hit the analyses unique key:
+    # every request succeeds with the same id and only one version is stored.
+    body = {
+        "rules": [
+            {"cidr": "10.0.0.0/8", "action": "permit"},
+            {"cidr": "10.1.0.0/16", "action": "deny"},
+        ]
+    }
+    barrier = threading.Barrier(8)
+    responses: list = []
+    lock = threading.Lock()
+
+    def submit(i: int) -> None:
+        barrier.wait()
+        r = client.post("/api/analyze", json={**body, "name": f"race-{i}"})
+        with lock:
+            responses.append(r)
+
+    threads = [threading.Thread(target=submit, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(r.status_code == 200 for r in responses)
+    payloads = [r.json() for r in responses]
+    assert len({p["id"] for p in payloads}) == 1
+    # Every racer observes the single stored version's metadata, even though
+    # each submitted a different name.
+    assert len({p["name"] for p in payloads}) == 1
+    assert len({p["created_at"] for p in payloads}) == 1
+    assert all(p["persisted"] for p in payloads)
+
+    aid = payloads[0]["id"]
+    assert client.get("/api/analyses").json()["total"] == 1
+    # Exactly one copy of the rules/findings was stored.
+    assert client.get(f"/api/analyses/{aid}/rules").json()["count"] == 2
+    fetched = client.get(f"/api/analyses/{aid}").json()
+    assert fetched["name"] == payloads[0]["name"]
+    assert fetched["created_at"] == payloads[0]["created_at"]
 
 
 def test_rules_and_findings_query_filters(client: TestClient) -> None:

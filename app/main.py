@@ -174,7 +174,11 @@ def analyze(req: AnalyzeRequest) -> dict[str, Any]:
     """Analyze a rule set.
 
     The analysis is deterministic: identical inputs always produce the same
-    ``ruleset_hash`` and the same ``id`` (stored versions are deduplicated).
+    ``ruleset_hash`` and the same ``id``.  With ``save`` enabled, repeated or
+    concurrent submissions of the same rule set atomically reuse the first
+    saved version: every successful response carries that version's ``id``,
+    ``name`` and ``created_at`` (matching ``GET /api/analyses/{id}`` and the
+    version list), even when a repeat submits a different ``name``.
     """
     raw_rules = [r.model_dump(exclude_defaults=False) for r in req.rules]
     # model_dump turns unset rule_id into None; the analyzer assigns r1, r2...
@@ -182,14 +186,20 @@ def analyze(req: AnalyzeRequest) -> dict[str, Any]:
 
     analysis_id = _make_id(result["ruleset_hash"])
     persisted = False
+    name = req.name
+    created_at = db.utc_now_iso()
     if req.save:
-        saved_id = db.save_analysis(analysis_id, req.name, result)
+        saved = db.save_analysis(analysis_id, req.name, result)
         persisted = True
-        analysis_id = saved_id
+        analysis_id = saved["id"]
+        # A repeat submission reuses the first saved version: report its
+        # stored metadata, not this request's.
+        name = saved["name"]
+        created_at = saved["created_at"]
 
     result["id"] = analysis_id
-    result["name"] = req.name
-    result["created_at"] = db.utc_now_iso()
+    result["name"] = name
+    result["created_at"] = created_at
     result["persisted"] = persisted
     return result
 
