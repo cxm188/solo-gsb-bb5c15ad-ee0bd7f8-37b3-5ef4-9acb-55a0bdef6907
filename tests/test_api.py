@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app import db
+from app.analyzer import analyze_rules
 
 
 @pytest.fixture()
@@ -268,4 +270,126 @@ def test_save_false_is_not_persisted(client: TestClient) -> None:
         json={"rules": [{"cidr": "10.0.0.0/8", "action": "permit"}], "save": False},
     )
     assert r.json()["persisted"] is False
+    assert client.get("/api/analyses").json()["total"] == 0
+
+
+def test_duplicate_submit_keeps_first_version_metadata(client: TestClient) -> None:
+    # A resubmit with a *different* name reuses the stored version: its name
+    # and created_at come from the first save and match GET / list responses.
+    body = {"name": "first-name", "rules": [{"cidr": "10.0.0.0/8", "action": "permit"}]}
+    first = client.post("/api/analyze", json=body).json()
+    second = client.post("/api/analyze", json={**body, "name": "later-name"}).json()
+
+    assert second["id"] == first["id"]
+    assert second["name"] == "first-name"
+    assert second["created_at"] == first["created_at"]
+    assert second["persisted"] is True
+
+    assert client.get("/api/analyses").json()["total"] == 1
+
+    fetched = client.get(f"/api/analyses/{first['id']}").json()
+    assert fetched["name"] == "first-name"
+    assert fetched["created_at"] == first["created_at"]
+
+    listing = client.get("/api/analyses").json()["analyses"][0]
+    assert listing["name"] == "first-name"
+    assert listing["created_at"] == first["created_at"]
+
+
+def test_concurrent_identical_saves_share_one_version(client: TestClient) -> None:
+    # N racing requests with the same ruleset must all succeed, share one id,
+    # and leave exactly one stored version with one set of rules/findings.
+    body = {"rules": [{"cidr": "10.0.0.0/8", "action": "permit"}]}
+    n = 12
+    barrier = threading.Barrier(n)
+    responses: list[dict] = []
+    errors: list[Exception] = []
+
+    def submit() -> None:
+        try:
+            barrier.wait()
+            r = client.post("/api/analyze", json=body)
+            assert r.status_code == 200, r.text
+            responses.append(r.json())
+        except Exception as exc:  # pragma: no defensive - surfaced by assertions
+            errors.append(exc)
+
+    threads = [threading.Thread(target=submit) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    assert len(responses) == n
+    assert len({r["id"] for r in responses}) == 1
+    assert all(r["persisted"] is True for r in responses)
+
+    listing = client.get("/api/analyses").json()
+    assert listing["total"] == 1
+    aid = listing["analyses"][0]["id"]
+    with db._connect() as conn:  # type: ignore[attr-defined]
+        assert conn.execute("SELECT COUNT(*) AS c FROM analyses").fetchone()["c"] == 1
+        assert conn.execute("SELECT COUNT(*) AS c FROM rules").fetchone()["c"] == 1
+        assert conn.execute("SELECT COUNT(*) AS c FROM findings").fetchone()["c"] == 0
+
+
+def test_concurrent_save_analysis_calls_are_atomic() -> None:
+    # Direct persistence-layer race: concurrent saves of the same ruleset hash
+    # reuse one stored row even when each caller passes a different name.
+    fd, path = tempfile.mkstemp(suffix=".db", prefix="ppa-test-")
+    os.close(fd)
+    os.remove(path)
+    db.reset_db(path)
+    try:
+        result = analyze_rules([{"cidr": "10.0.0.0/8", "action": "permit"}])
+        analysis_id = "an_" + result["ruleset_hash"][:16]
+        n = 8
+        barrier = threading.Barrier(n)
+        outcomes: list[dict] = []
+        errors: list[Exception] = []
+
+        def save(slot: int) -> None:
+            try:
+                barrier.wait()
+                outcomes.append(
+                    db.save_analysis(analysis_id, f"name-{slot}", result)
+                )
+            except Exception as exc:  # pragma: no defensive
+                errors.append(exc)
+
+        threads = [threading.Thread(target=save, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        assert len({o["id"] for o in outcomes}) == 1
+        assert len({o["name"] for o in outcomes}) == 1
+        assert sum(1 for o in outcomes if not o["reused"]) == 1
+        assert len({o["created_at"] for o in outcomes}) == 1
+        with db._connect() as conn:  # type: ignore[attr-defined]
+            assert conn.execute("SELECT COUNT(*) AS c FROM analyses").fetchone()["c"] == 1
+            assert conn.execute("SELECT COUNT(*) AS c FROM rules").fetchone()["c"] == 1
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(path + suffix)
+            except OSError:
+                pass
+
+
+def test_save_false_name_is_reflected_without_persisting(client: TestClient) -> None:
+    r = client.post(
+        "/api/analyze",
+        json={
+            "name": "draft-only",
+            "rules": [{"cidr": "10.0.0.0/8", "action": "permit"}],
+            "save": False,
+        },
+    )
+    data = r.json()
+    assert data["name"] == "draft-only"
+    assert data["persisted"] is False
     assert client.get("/api/analyses").json()["total"] == 0

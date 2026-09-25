@@ -59,7 +59,11 @@ CREATE TABLE IF NOT EXISTS findings (
 
 CREATE INDEX IF NOT EXISTS idx_rules_analysis   ON rules(analysis_id);
 CREATE INDEX IF NOT EXISTS idx_findings_analysis ON findings(analysis_id);
-CREATE INDEX IF NOT EXISTS idx_analyses_hash    ON analyses(ruleset_hash);
+-- Unique so identical rule sets map to exactly one stored version. The
+-- save_analysis write transaction serializes on this constraint; for a
+-- database created before the constraint existed, init_db replaces the old
+-- non-unique index with this one in place.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_analyses_hash ON analyses(ruleset_hash);
 
 -- Singleton publication pointer: exactly one row (id = 1). It starts at
 -- revision 0 with no published version and only points at saved analyses.
@@ -139,9 +143,35 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_unique_hash_index(conn: sqlite3.Connection) -> None:
+    """Upgrade a legacy non-unique ``idx_analyses_hash`` to the unique version.
+
+    Databases created before saves were deduplicated atomically carry the
+    index as non-unique (``CREATE UNIQUE INDEX IF NOT EXISTS`` is a no-op on
+    the already-existing name). DDL is transactional in SQLite, so dropping
+    and recreating the index inside one transaction leaves the legacy index
+    in place should duplicate hashes (possible only under the old racy save)
+    make the unique creation fail — the existing data is never damaged.
+    """
+    row = conn.execute(
+        "SELECT \"unique\" FROM pragma_index_list('analyses') WHERE name = 'idx_analyses_hash'"
+    ).fetchone()
+    if row is not None and row["unique"] == 1:
+        return
+    conn.execute("BEGIN")
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_analyses_hash")
+        conn.execute("CREATE UNIQUE INDEX idx_analyses_hash ON analyses(ruleset_hash)")
+    except sqlite3.IntegrityError:
+        conn.execute("ROLLBACK")
+    else:
+        conn.execute("COMMIT")
+
+
 def init_db() -> None:
     with _connect() as conn:
         conn.executescript(_SCHEMA)
+        _ensure_unique_hash_index(conn)
 
 
 def reset_db(path: str | None = None) -> None:
@@ -164,17 +194,39 @@ def save_analysis(
     analysis_id: str,
     name: str | None,
     result: dict[str, Any],
-) -> str:
-    """Persist a complete analysis. Returns the id (existing id if the same
-    ruleset hash was already stored — the API makes repeated submits idempotent).
+) -> dict[str, Any]:
+    """Persist a complete analysis, atomically reusing an identical stored version.
+
+    Returns the stored version metadata: ``{"id", "name", "created_at",
+    "reused"}``. Concurrent submissions of the same ruleset hash are
+    serialized inside one ``BEGIN IMMEDIATE`` write transaction, so the
+    check-then-insert race (two requests both seeing no row and then colliding
+    on the unique constraints) cannot happen: exactly one request performs
+    the insert — one ``analyses`` row plus that version's rules and findings —
+    and every other request reads that row back. The unique index on
+    ``ruleset_hash`` (and the primary key on ``id``) remain the final
+    backstop. Reused versions keep the *first* save's name and created_at;
+    the duplicate request's name is ignored.
     """
-    with _connect() as conn:
+    ruleset_hash = result["ruleset_hash"]
+    conn = _connect()
+    # An unmanaged transaction: BEGIN IMMEDIATE takes the write lock up front
+    # so two competing saves cannot both observe "no existing row".
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
-            "SELECT id FROM analyses WHERE ruleset_hash = ?",
-            (result["ruleset_hash"],),
+            "SELECT id, name, created_at FROM analyses WHERE ruleset_hash = ?",
+            (ruleset_hash,),
         ).fetchone()
         if existing is not None:
-            return existing["id"]
+            conn.execute("COMMIT")
+            return {
+                "id": existing["id"],
+                "name": existing["name"],
+                "created_at": existing["created_at"],
+                "reused": True,
+            }
 
         created_at = utc_now_iso()
         conn.execute(
@@ -184,7 +236,7 @@ def save_analysis(
             (
                 analysis_id,
                 name,
-                result["ruleset_hash"],
+                ruleset_hash,
                 result["analyzer_version"],
                 created_at,
                 result["summary"]["rule_count"],
@@ -236,7 +288,22 @@ def save_analysis(
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             finding_rows,
         )
-        return analysis_id
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        conn.close()
+        raise
+    conn.close()
+
+    return {
+        "id": analysis_id,
+        "name": name,
+        "created_at": created_at,
+        "reused": False,
+    }
 
 
 def get_analysis(analysis_id: str) -> dict[str, Any] | None:

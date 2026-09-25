@@ -174,23 +174,32 @@ def analyze(req: AnalyzeRequest) -> dict[str, Any]:
     """Analyze a rule set.
 
     The analysis is deterministic: identical inputs always produce the same
-    ``ruleset_hash`` and the same ``id`` (stored versions are deduplicated).
+    ``ruleset_hash`` and the same ``id``. Saving is idempotent, even under
+    concurrent submission: the first successful save of a given ruleset hash
+    creates the immutable version (and its rules/findings) and every later
+    save — including requests racing the first one — is reused as-is. The
+    response metadata of every successful request is therefore the stored
+    version's ``id``/``name``/``created_at`` (a duplicate's own ``name`` is
+    ignored), matching GET /api/analyses/{id} and the version list.
     """
     raw_rules = [r.model_dump(exclude_defaults=False) for r in req.rules]
     # model_dump turns unset rule_id into None; the analyzer assigns r1, r2...
     result = analyze_rules(raw_rules)
 
     analysis_id = _make_id(result["ruleset_hash"])
-    persisted = False
     if req.save:
-        saved_id = db.save_analysis(analysis_id, req.name, result)
-        persisted = True
-        analysis_id = saved_id
-
-    result["id"] = analysis_id
-    result["name"] = req.name
-    result["created_at"] = db.utc_now_iso()
-    result["persisted"] = persisted
+        saved = db.save_analysis(analysis_id, req.name, result)
+        result["id"] = saved["id"]
+        result["name"] = saved["name"]
+        result["created_at"] = saved["created_at"]
+        result["persisted"] = True
+    else:
+        # Analysis only: nothing is written, so the response carries the
+        # request-supplied name and a fresh timestamp rather than stored metadata.
+        result["id"] = analysis_id
+        result["name"] = req.name
+        result["created_at"] = db.utc_now_iso()
+        result["persisted"] = False
     return result
 
 
